@@ -1,0 +1,20 @@
+{
+  "name": "photovault-local-ai",
+  "version": "1.0.0",
+  "description": "Privacy-first offline desktop photo organizer with visual similarity and local face clustering",
+  "type": "module",
+  "author": "kunalrai1234",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "start": "python backend/app.py --desktop",
+    "desktop": "python backend/app.py --desktop",
+    "test": "pytest backend/tests/"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}
