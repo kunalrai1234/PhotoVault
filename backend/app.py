@@ -5,9 +5,11 @@ import argparse
 from typing import Dict, Any, List
 from bottle import Bottle, request, response, static_file, run
 
-# Import local core modules
+# Ensure backend directory is in sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from core.cache import MetadataCache
-from core.scanner import FolderScanner
+from core.scanner import FolderScanner, sanitize_folder_path
 from core.duplicates import ExactDuplicateEngine
 from core.similarity import VisualSimilarityEngine
 from core.faces import FaceEngine
@@ -36,7 +38,7 @@ state: Dict[str, Any] = {
     "face_clusters": [],
     "scan_progress": {"current": 0, "total": 0, "status": "idle"},
     "ai_settings": {
-        "gemini": {"enabled": False, "model": "gemini-1.5-flash"},
+        "gemini": {"enabled": False, "model": "gemini-3.5-flash"},
         "openai": {"enabled": False, "model": "gpt-4o", "base_url": "https://api.openai.com/v1"},
         "claude": {"enabled": False, "model": "claude-3-5-sonnet-20241022"}
     }
@@ -57,7 +59,26 @@ def after_request():
 def handle_options():
     return {}
 
-# 1. Status & Dashboard
+# 1. Native Windows Folder Picker Dialog
+@app.route('/api/pick-folder', method='POST')
+def pick_folder():
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        folder = filedialog.askdirectory(title="Select Photo Folder to Scan with PhotoVault")
+        root.destroy()
+        if folder:
+            sanitized = sanitize_folder_path(folder)
+            return {"folder": sanitized}
+        return {"folder": None}
+    except Exception as e:
+        print(f"[PickFolder] Dialog error: {e}")
+        return {"folder": None, "error": str(e)}
+
+# 2. Status & Dashboard
 @app.route('/api/status', method='GET')
 def get_status():
     return {
@@ -69,14 +90,25 @@ def get_status():
         "scan_progress": state["scan_progress"]
     }
 
-# 2. Folder Selection & Scanning
+# 3. Folder Selection & Scanning
 @app.route('/api/scan', method='POST')
 def start_scan():
     data = request.json or {}
-    folders = data.get("folders", [])
-    if not folders:
+    raw_folders = data.get("folders", [])
+    if not raw_folders:
         response.status = 400
         return {"error": "No folders specified."}
+
+    # Clean and filter folder paths
+    folders = []
+    for f in raw_folders:
+        clean = sanitize_folder_path(f)
+        if clean and os.path.exists(clean) and clean not in folders:
+            folders.append(clean)
+
+    if not folders:
+        response.status = 400
+        return {"error": "None of the specified folders exist on this computer."}
 
     state["scanned_folders"] = folders
     state["scan_progress"] = {"current": 0, "total": 0, "status": "scanning"}
@@ -85,28 +117,29 @@ def start_scan():
         state["scan_progress"]["current"] = current
         state["scan_progress"]["status"] = f"Scanning {os.path.basename(path)}"
 
-    # Run scan
+    # 1. Recursive scan & thumbnail extraction
     photos = scanner.scan_paths(folders, progress_callback=on_progress)
     
-    # Run categorizer and face detection on new photos
-    for photo in photos:
-        # Detect faces if model available
-        faces = face_engine.detect_faces(photo["path"])
-        photo["faces"] = faces
-        # Categorize
-        photo["tags"] = categorizer.categorize_image(photo, faces=faces)
-        cache.put(photo["path"], photo)
+    # 2. Extract faces and categories safely
+    for idx, photo in enumerate(photos):
+        try:
+            faces = face_engine.detect_faces(photo["path"])
+            photo["faces"] = faces
+            photo["tags"] = categorizer.categorize_image(photo, faces=faces)
+            cache.put(photo["path"], photo)
+        except Exception as e:
+            print(f"[Scan] Error analyzing {photo['path']}: {e}")
 
     cache.save()
     state["photos"] = photos
 
-    # Calculate duplicate groups
+    # 3. Exact duplicates
     state["duplicate_groups"] = duplicate_engine.find_duplicates(photos)
 
-    # Calculate similarity groups (balanced by default)
+    # 4. Visual similarity
     state["similarity_groups"] = similarity_engine.find_similar_groups(photos, mode="balanced")
 
-    # Cluster faces
+    # 5. Face clusters
     state["face_clusters"] = face_engine.cluster_faces()
 
     state["scan_progress"] = {"current": len(photos), "total": len(photos), "status": "completed"}
@@ -123,11 +156,10 @@ def cancel_scan():
     state["scan_progress"]["status"] = "cancelled"
     return {"status": "cancelled"}
 
-# 3. Photos List & Filtering
+# 4. Photos List & Filtering
 @app.route('/api/photos', method='GET')
 def get_photos():
     category = request.query.get('category')
-    tag = request.query.get('tag')
     search = request.query.get('search', '').lower()
 
     filtered = state["photos"]
@@ -138,12 +170,12 @@ def get_photos():
 
     return {"photos": filtered, "total": len(filtered)}
 
-# 4. Duplicates API
+# 5. Duplicates API
 @app.route('/api/duplicates', method='GET')
 def get_duplicates():
     return {"groups": state["duplicate_groups"]}
 
-# 5. Visual Similarity API
+# 6. Visual Similarity API
 @app.route('/api/similarity', method='GET')
 def get_similarity():
     mode = request.query.get('mode', 'balanced')
@@ -151,7 +183,7 @@ def get_similarity():
         state["similarity_groups"] = similarity_engine.find_similar_groups(state["photos"], mode=mode)
     return {"groups": state["similarity_groups"], "mode": mode}
 
-# 6. Face Clusters API
+# 7. Face Clusters API
 @app.route('/api/faces', method='GET')
 def get_faces():
     return {"clusters": state["face_clusters"]}
@@ -182,7 +214,7 @@ def merge_face_clusters():
     response.status = 400
     return {"error": "Invalid target or source id"}
 
-# 7. Safe Cleanup & Recycle Bin API
+# 8. Safe Cleanup & Recycle Bin API
 @app.route('/api/cleanup/recycle', method='POST')
 def recycle_files():
     data = request.json or {}
@@ -192,18 +224,15 @@ def recycle_files():
         return {"error": "No files selected."}
 
     result = organizer.safe_delete_files(file_paths)
-    
-    # Remove from state
     recycled_set = set(result.get("recycled_files", []))
     state["photos"] = [p for p in state["photos"] if p["path"] not in recycled_set]
     
-    # Recalculate duplicates & similarity
     state["duplicate_groups"] = duplicate_engine.find_duplicates(state["photos"])
     state["similarity_groups"] = similarity_engine.find_similar_groups(state["photos"])
 
     return result
 
-# 8. Organization Plan & Execution API
+# 9. Organization Plan & Execution API
 @app.route('/api/organize/plan', method='POST')
 def plan_organization():
     data = request.json or {}
@@ -215,9 +244,10 @@ def plan_organization():
         response.status = 400
         return {"error": "Target directory is required."}
 
+    clean_target = sanitize_folder_path(target_root)
     plan = organizer.generate_plan(
         photos=state["photos"],
-        target_root=target_root,
+        target_root=clean_target,
         group_by=group_by,
         action=action
     )
@@ -234,7 +264,27 @@ def execute_organization():
     result = organizer.execute_plan(plan)
     return result
 
-# 9. AI Settings & Secure Key Storage API
+# 10. AI Vision Description & Tagging API
+@app.route('/api/ai/describe', method='POST')
+def ai_describe_photo():
+    data = request.json or {}
+    image_path = data.get("image_path")
+    prompt = data.get("prompt", "Analyze this photo in 2-3 sentences. Identify what is in the scene, the setting, subjects, and main colors.")
+
+    if not image_path or not os.path.exists(image_path):
+        response.status = 400
+        return {"error": "Image file not found."}
+
+    key = CredentialVault.get_api_key("gemini")
+    if not key:
+        response.status = 400
+        return {"error": "Gemini API key is not configured in Settings."}
+
+    adapter = GeminiAdapter(api_key=key, model_name=state["ai_settings"]["gemini"]["model"], is_enabled=True)
+    res = adapter.analyze_images([image_path], prompt=prompt)
+    return res
+
+# 11. AI Settings & Secure Key Storage API
 @app.route('/api/ai/settings', method='GET')
 def get_ai_settings():
     providers = {}
@@ -252,7 +302,7 @@ def save_ai_key():
     data = request.json or {}
     provider = data.get("provider")
     key = data.get("api_key")
-    enabled = data.get("enabled", False)
+    enabled = data.get("enabled", True)
 
     if provider in ["gemini", "openai", "claude"]:
         if key:
@@ -265,7 +315,7 @@ def save_ai_key():
 @app.route('/api/ai/test-connection', method='POST')
 def test_ai_connection():
     data = request.json or {}
-    provider = data.get("provider")
+    provider = data.get("provider", "gemini")
     key = CredentialVault.get_api_key(provider)
     if not key:
         return {"success": False, "message": "No API key found in Windows Credential Manager."}
@@ -281,7 +331,7 @@ def test_ai_connection():
 
     return adapter.test_connection()
 
-# 10. Thumbnail & File Serving
+# 12. Thumbnail & Local File Serving
 @app.route('/thumbnail/<path:path>')
 def serve_thumbnail(path):
     cache_dir = os.path.abspath(".photovault_cache/thumbnails")
@@ -289,7 +339,6 @@ def serve_thumbnail(path):
 
 @app.route('/local-image/<path:path>')
 def serve_local_image(path):
-    # Drive letter handling for Windows (e.g. D:/photos)
     if ":" in path:
         drive, rest = path.split(":", 1)
         full_path = drive + ":" + rest
@@ -305,7 +354,6 @@ def serve_frontend(path="index.html"):
     dist_dir = os.path.abspath("dist")
     if os.path.exists(os.path.join(dist_dir, path)):
         return static_file(path, root=dist_dir)
-    # Fallback to src if dist not yet built
     src_dir = os.path.abspath("src")
     if os.path.exists(os.path.join(src_dir, path)):
         return static_file(path, root=src_dir)
@@ -315,14 +363,12 @@ def run_desktop_app():
     import webview
     import threading
 
-    # Start bottle server in background daemon thread
     server_thread = threading.Thread(
         target=lambda: run(app, host="127.0.0.1", port=54321, quiet=True),
         daemon=True
     )
     server_thread.start()
 
-    # Desktop API for native OS interactions (folder picker)
     class DesktopAPI:
         def select_folder(self):
             window = webview.windows[0]

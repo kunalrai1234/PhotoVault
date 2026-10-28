@@ -57,6 +57,7 @@ class PhotoVaultApp {
   public get currentSelectedPhoto(): Photo | null {
     return this.selectedPhoto;
   }
+
   private duplicateGroups: DuplicateGroup[] = [];
   private similarityGroups: SimilarityGroup[] = [];
   private faceClusters: FaceCluster[] = [];
@@ -169,9 +170,12 @@ class PhotoVaultApp {
           <p style="color:var(--text-muted); font-size:13px; line-height:1.6;">
             Your privacy-first, 100% offline desktop photo manager. Scans folders recursively, detects exact byte duplicates via SHA-256, groups burst shots with perceptual hashing, and clusters people locally using local AI vision models.
           </p>
-          <div style="display:flex; gap:12px; margin-top:16px;">
-            <button class="btn btn-primary" onclick="app.promptAddFolder()">➕ Add Photo Folder</button>
-            <button class="btn" onclick="app.runScan()">⚡ Run Scan & Analysis</button>
+          
+          <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <button class="btn btn-primary" onclick="app.promptAddFolder()">📂 Select Folder (Browse)</button>
+            <span style="font-size:12px; color:var(--text-dim);">or enter path:</span>
+            <input type="text" id="manual-folder-input" placeholder="e.g. D:\\Photos or C:\\Users\\...\\Pictures" class="btn" style="flex:1; min-width:240px; text-align:left; cursor:text;"/>
+            <button class="btn" onclick="app.addManualFolder()">Add & Scan</button>
           </div>
         </div>
 
@@ -198,7 +202,7 @@ class PhotoVaultApp {
           <div style="font-size:14px; font-weight:600; margin-bottom:12px;">Scanned Root Folders</div>
           ${
             this.scannedFolders.length === 0
-              ? '<p style="color:var(--text-dim); font-size:13px;">No folders added yet. Click "Add Photo Folder" above to get started.</p>'
+              ? '<p style="color:var(--text-dim); font-size:13px;">No folders added yet. Click "Select Folder (Browse)" above to select your photos.</p>'
               : `<ul style="font-size:13px; list-style:none; display:flex; flex-direction:column; gap:6px;">
                   ${this.scannedFolders.map((f) => `<li style="font-family:monospace; background:var(--bg-tertiary); padding:6px 10px; border-radius:var(--radius-sm);">📁 ${f}</li>`).join("")}
                 </ul>`
@@ -208,9 +212,20 @@ class PhotoVaultApp {
     `;
   }
 
+  public addManualFolder() {
+    const input = document.getElementById("manual-folder-input") as HTMLInputElement;
+    if (input && input.value && input.value.trim()) {
+      const val = input.value.trim();
+      if (!this.scannedFolders.includes(val)) {
+        this.scannedFolders.push(val);
+      }
+      this.runScan();
+    }
+  }
+
   private renderPhotoGrid(root: HTMLElement, photoList: Photo[]) {
     if (photoList.length === 0) {
-      root.innerHTML = `<div style="text-align:center; padding: 60px; color:var(--text-dim);">No photos found in this view.</div>`;
+      root.innerHTML = `<div style="text-align:center; padding: 60px; color:var(--text-dim);">No photos found in this view. Click "Add Folder" to scan your images.</div>`;
       return;
     }
 
@@ -515,22 +530,74 @@ class PhotoVaultApp {
       const tags = photo.tags || ["Other"];
       tagsContainer.innerHTML = tags.map((t) => `<span class="tag-pill">${t}</span>`).join("");
     }
+
+    // AI Vision Box
+    const aiBox = document.getElementById("insp-ai-desc");
+    if (aiBox) {
+      aiBox.innerHTML = `
+        <button class="btn btn-primary" style="width:100%; font-size:11px; margin-top:8px;" onclick="app.askGeminiForPhoto('${photo.path}')">
+          ✨ Ask Gemini Vision to Describe Photo
+        </button>
+        <div id="ai-desc-text" style="font-size:11px; color:var(--text-muted); margin-top:8px; line-height:1.4;"></div>
+      `;
+    }
   }
 
-  // --- Actions & Modals ---
+  public async askGeminiForPhoto(imagePath: string) {
+    const descEl = document.getElementById("ai-desc-text");
+    if (descEl) descEl.innerText = "Analyzing with Google Gemini (gemini-3.5-flash)...";
+
+    try {
+      const res = await fetch(`${API_BASE}/ai/describe`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_path: imagePath })
+      });
+      const data = await res.json();
+      if (data.success && descEl) {
+        descEl.innerHTML = `<strong>Gemini Vision:</strong><br/>${data.analysis}`;
+      } else if (descEl) {
+        descEl.innerText = `Error: ${data.error || "Failed to analyze"}`;
+      }
+    } catch (e: any) {
+      if (descEl) descEl.innerText = `Error: ${e.message}`;
+    }
+  }
+
+  // --- Folder & Scan Actions ---
 
   public async promptAddFolder() {
     let folderPath: string | null = null;
-    // Check if running inside desktop pywebview
-    if ((window as any).pywebview && (window as any).pywebview.api) {
-      folderPath = await (window as any).pywebview.api.select_folder();
-    } else {
-      folderPath = prompt("Enter the absolute folder path to scan (e.g. D:\\Pictures or C:\\Users\\...):");
+    
+    // First try the native Windows Folder Picker API on the backend
+    try {
+      const res = await fetch(`${API_BASE}/pick-folder`, { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.folder) {
+          folderPath = data.folder;
+        }
+      }
+    } catch (e) {
+      console.warn("Backend pick-folder failed, trying pywebview/prompt", e);
+    }
+
+    // Fallback if dialog cancelled or not opened
+    if (!folderPath) {
+      if ((window as any).pywebview && (window as any).pywebview.api) {
+        folderPath = await (window as any).pywebview.api.select_folder();
+      }
+    }
+
+    if (!folderPath) {
+      const manual = prompt("Enter the absolute folder path to scan (e.g. D:\\Photos or C:\\Users\\...):");
+      if (manual && manual.trim()) folderPath = manual.trim();
     }
 
     if (folderPath && folderPath.trim()) {
-      if (!this.scannedFolders.includes(folderPath.trim())) {
-        this.scannedFolders.push(folderPath.trim());
+      const clean = folderPath.trim();
+      if (!this.scannedFolders.includes(clean)) {
+        this.scannedFolders.push(clean);
       }
       this.runScan();
     }
@@ -552,12 +619,18 @@ class PhotoVaultApp {
         body: JSON.stringify({ folders: this.scannedFolders })
       });
       if (res.ok) {
-        if (statusText) statusText.innerText = "Scan complete";
+        const data = await res.json();
+        if (statusText) statusText.innerText = `Scan complete (${data.total_scanned} photos)`;
         await this.loadPhotos();
+        this.switchView("all-photos");
+      } else {
+        const err = await res.json();
+        alert(`Scan failed: ${err.error || "Unknown error"}`);
+        if (statusText) statusText.innerText = "Scan failed";
       }
-    } catch (e) {
-      if (statusText) statusText.innerText = "Scan failed";
-      console.error(e);
+    } catch (e: any) {
+      if (statusText) statusText.innerText = "Scan error";
+      alert(`Could not connect to scan engine: ${e.message}`);
     }
   }
 
@@ -655,26 +728,29 @@ class PhotoVaultApp {
       <div class="modal-overlay">
         <div class="modal-dialog">
           <div class="modal-header">
-            <span>⚙️ AI Provider Settings (Optional)</span>
+            <span>⚙️ AI Provider Settings</span>
             <button class="btn" style="padding:2px 6px;" onclick="app.closeModal()">✕</button>
           </div>
           <div class="modal-body">
             <div style="background:var(--bg-tertiary); border-left:3px solid var(--accent); padding:10px; font-size:12px; margin-bottom:14px;">
-              🔒 <strong>Strict Privacy Notice:</strong> PhotoVault Local AI works 100% offline. All face clustering and duplicate detection is done locally on your CPU. Connecting external vision APIs is completely optional and disabled by default. Keys are stored in the Windows Credential Vault.
+              🔒 <strong>Strict Privacy Notice:</strong> PhotoVault Local AI works 100% offline. Local face clustering and duplicate detection runs on your CPU. External vision APIs (Google Gemini) are optional. Keys are saved in Windows Credential Manager.
             </div>
 
             <div style="display:flex; flex-direction:column; gap:12px;">
               <div style="border:1px solid var(--border-color); border-radius:var(--radius-md); padding:12px;">
-                <div style="font-weight:600; font-size:13px;">Google Gemini (e.g. gemini-1.5-flash)</div>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <div style="font-weight:600; font-size:13px;">Google Gemini (Active: gemini-3.5-flash)</div>
+                  <span class="badge" style="background:var(--success); color:white;">Configured ✓</span>
+                </div>
                 <div style="display:flex; gap:8px; margin-top:8px;">
-                  <input type="password" id="key-gemini" placeholder="Enter Gemini API Key" class="btn" style="flex:1; text-align:left;"/>
+                  <input type="password" id="key-gemini" placeholder="Enter your Gemini API Key" class="btn" style="flex:1; text-align:left;"/>
                   <button class="btn" onclick="app.saveKey('gemini')">Save Key</button>
-                  <button class="btn" onclick="app.testKey('gemini')">Test</button>
+                  <button class="btn btn-primary" onclick="app.testKey('gemini')">Test Connection</button>
                 </div>
               </div>
 
               <div style="border:1px solid var(--border-color); border-radius:var(--radius-md); padding:12px;">
-                <div style="font-weight:600; font-size:13px;">OpenAI / Compatible (GPT-4o, OpenRouter)</div>
+                <div style="font-weight:600; font-size:13px;">OpenAI / Compatible (GPT-4o)</div>
                 <div style="display:flex; gap:8px; margin-top:8px;">
                   <input type="password" id="key-openai" placeholder="Enter OpenAI API Key" class="btn" style="flex:1; text-align:left;"/>
                   <button class="btn" onclick="app.saveKey('openai')">Save Key</button>
@@ -703,7 +779,6 @@ class PhotoVaultApp {
 
     if (res.ok) {
       alert(`${provider.toUpperCase()} key securely stored in Windows Credential Vault!`);
-      input.value = "";
     }
   }
 
@@ -835,6 +910,5 @@ class PhotoVaultApp {
   }
 }
 
-// Instantiate globally
 const app = new PhotoVaultApp();
 (window as any).app = app;

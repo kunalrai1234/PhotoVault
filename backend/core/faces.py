@@ -3,6 +3,17 @@ import cv2
 import numpy as np
 from typing import List, Dict, Any, Optional
 
+def cv2_imread_safe(image_path: str) -> Optional[np.ndarray]:
+    """Safe image reader handling Windows Unicode/non-ASCII paths seamlessly."""
+    try:
+        with open(image_path, "rb") as f:
+            chunk = f.read()
+        arr = np.frombuffer(chunk, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        print(f"[Faces] cv2_imread_safe error on {image_path}: {e}")
+        return None
+
 class FaceEngine:
     """
     Local-first face detection and recognition engine.
@@ -19,16 +30,14 @@ class FaceEngine:
         self.recognizer: Optional[Any] = None
         self.is_enabled = True
         
-        # In-memory cluster storage
-        self.clusters: Dict[str, Dict[str, Any]] = {} # cluster_id -> { "name": str, "face_ids": [] }
-        self.face_metadata: Dict[str, Dict[str, Any]] = {} # face_id -> metadata + embedding
+        self.clusters: Dict[str, Dict[str, Any]] = {}
+        self.face_metadata: Dict[str, Dict[str, Any]] = {}
 
         self._init_models()
 
     def _init_models(self) -> None:
         if os.path.exists(self.yunet_path):
             try:
-                # Default input size (320, 320) - dynamically resized per image
                 self.detector = cv2.FaceDetectorYN.create(
                     self.yunet_path, "", (320, 320), 0.7, 0.3, 5000
                 )
@@ -46,7 +55,7 @@ class FaceEngine:
     def detect_faces(self, image_path: str) -> List[Dict[str, Any]]:
         """
         Detects faces in an image and extracts normalized embeddings.
-        Supports photos with multiple faces.
+        Downscales high-resolution images to max 640px for blazing-fast CPU inference.
         """
         if not self.is_enabled:
             return []
@@ -55,36 +64,60 @@ class FaceEngine:
             return []
 
         try:
-            img = cv2.imread(image_path)
+            img = cv2_imread_safe(image_path)
             if img is None:
                 return []
 
-            h, w = img.shape[:2]
+            orig_h, orig_w = img.shape[:2]
             faces_found: List[Dict[str, Any]] = []
 
             if self.detector is not None:
-                # Resize detector input size to match image dimensions
-                self.detector.setInputSize((w, h))
-                _, faces = self.detector.detect(img)
+                # Downsample for detection if image is large (> 640px)
+                max_dim = max(orig_w, orig_h)
+                scale = 1.0
+                if max_dim > 640:
+                    scale = 640.0 / max_dim
+                    detect_w = int(orig_w * scale)
+                    detect_h = int(orig_h * scale)
+                    detect_img = cv2.resize(img, (detect_w, detect_h))
+                else:
+                    detect_w, detect_h = orig_w, orig_h
+                    detect_img = img
+
+                self.detector.setInputSize((detect_w, detect_h))
+                _, faces = self.detector.detect(detect_img)
 
                 if faces is not None:
+                    inv_scale = 1.0 / scale
                     for idx, face_data in enumerate(faces):
-                        # Bounding box
-                        box = [int(v) for v in face_data[:4]] # x, y, width, height
+                        # Scale coordinates back to original image
+                        box = [
+                            int(face_data[0] * inv_scale),
+                            int(face_data[1] * inv_scale),
+                            int(face_data[2] * inv_scale),
+                            int(face_data[3] * inv_scale)
+                        ]
                         score = float(face_data[-1])
+
+                        # Un-scale face landmarks for SFace alignment
+                        orig_face_data = face_data.copy()
+                        orig_face_data[:4] = [box[0], box[1], box[2], box[3]]
+                        for p_idx in range(4, 14, 2):
+                            orig_face_data[p_idx] = face_data[p_idx] * inv_scale
+                            orig_face_data[p_idx + 1] = face_data[p_idx + 1] * inv_scale
 
                         # Extract embedding if recognizer available
                         embedding = None
                         if self.recognizer is not None:
                             try:
-                                aligned_face = self.recognizer.alignCrop(img, face_data)
+                                aligned_face = self.recognizer.alignCrop(img, orig_face_data)
                                 raw_feat = self.recognizer.feature(aligned_face)
                                 norm_feat = raw_feat / np.linalg.norm(raw_feat)
                                 embedding = norm_feat.flatten().tolist()
                             except Exception as e:
                                 print(f"[FaceEngine] Error extracting face feature: {e}")
 
-                        # Fallback heuristic embedding if recognizer model missing
+                        # Fallback heuristic embedding
                         if embedding is None:
                             x, y, bw, bh = max(0, box[0]), max(0, box[1]), box[2], box[3]
                             face_crop = img[y:y+bh, x:x+bw]
@@ -112,23 +145,17 @@ class FaceEngine:
             return []
 
     def cluster_faces(self, threshold: float = 0.363) -> List[Dict[str, Any]]:
-        """
-        Groups detected faces into conservative person clusters.
-        Cosine distance threshold: default 0.363 (SFace benchmark recommendation).
-        """
         all_face_ids = [fid for fid, f in self.face_metadata.items() if f.get("embedding")]
         n = len(all_face_ids)
         if n == 0:
             return []
 
         embeddings = np.array([self.face_metadata[fid]["embedding"] for fid in all_face_ids])
-        # Pairwise cosine distance
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         normed_emb = embeddings / np.maximum(norms, 1e-7)
         similarity_matrix = np.dot(normed_emb, normed_emb.T)
         distance_matrix = 1.0 - similarity_matrix
 
-        # Union-Find with conservative threshold
         parent = list(range(n))
         def find(i):
             path = []
@@ -155,7 +182,6 @@ class FaceEngine:
             root = find(i)
             groups.setdefault(root, []).append(all_face_ids[i])
 
-        # Separate multi-photo clusters from singletons ("Unknown")
         person_clusters = []
         cluster_counter = 1
         unknown_faces: List[Dict[str, Any]] = []
@@ -206,17 +232,14 @@ class FaceEngine:
         if target_cluster_id in self.clusters and source_cluster_id in self.clusters:
             src = self.clusters[source_cluster_id]
             tgt = self.clusters[target_cluster_id]
-            
             tgt["faces"].extend(src["faces"])
             tgt["photos"] = list(set(tgt["photos"] + src["photos"]))
             tgt["face_count"] = len(tgt["faces"])
             tgt["photo_count"] = len(tgt["photos"])
-
             del self.clusters[source_cluster_id]
             return True
         return False
 
     def delete_face_data(self) -> None:
-        """Deletes all stored in-memory face embeddings and cluster information."""
         self.clusters.clear()
         self.face_metadata.clear()

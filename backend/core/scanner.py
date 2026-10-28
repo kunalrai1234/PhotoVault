@@ -1,19 +1,33 @@
 import os
 import time
-from typing import List, Dict, Any, Generator, Callable, Optional
-from PIL import Image, ImageOps
+from typing import List, Dict, Any, Callable, Optional
+from PIL import Image, ImageOps, ImageFile
 import imagehash
 from .cache import MetadataCache
 
-# Supported image file extensions
+# Allow loading truncated or slightly corrupted camera photos
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None
+
+# Comprehensive image extensions (case-insensitive)
 SUPPORTED_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".heic"
 }
+
+def sanitize_folder_path(path_str: str) -> str:
+    """Normalizes and cleans input paths, stripping quotes, spaces, and handling Windows drives."""
+    if not path_str:
+        return ""
+    clean = path_str.strip(' "\'').replace('/', os.sep)
+    # Fix single drive letters like "D:" -> "D:\"
+    if len(clean) == 2 and clean[1] == ':':
+        clean += os.sep
+    return os.path.abspath(os.path.expanduser(clean))
 
 class FolderScanner:
     """
     Recursively scans directories for supported images without depth limits.
-    Resilient to corrupt files, extracts metadata, perceptual hashes, and thumbnails.
+    Handles truncated JPEGs, Unicode filepaths, and generates high-speed thumbnails.
     """
 
     def __init__(self, cache: MetadataCache):
@@ -33,24 +47,31 @@ class FolderScanner:
         all_photos: List[Dict[str, Any]] = []
         count = 0
 
-        # First pass: gather file candidates rapidly
+        # Gather file candidates
         file_candidates: List[tuple[str, str]] = [] # (root, full_path)
-        for root_dir in root_folders:
-            if not os.path.exists(root_dir):
+        for raw_root in root_folders:
+            root_dir = sanitize_folder_path(raw_root)
+            if not root_dir or not os.path.exists(root_dir):
+                print(f"[Scanner] Path does not exist or inaccessible: '{raw_root}' -> '{root_dir}'")
                 continue
-            for dirpath, _, filenames in os.walk(root_dir):
-                if self.is_cancelled:
-                    break
-                for fname in filenames:
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext in SUPPORTED_EXTENSIONS:
-                        full_path = os.path.join(dirpath, fname)
-                        file_candidates.append((root_dir, full_path))
+
+            print(f"[Scanner] Scanning directory: '{root_dir}'")
+            try:
+                for dirpath, _, filenames in os.walk(root_dir):
+                    if self.is_cancelled:
+                        break
+                    for fname in filenames:
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext in SUPPORTED_EXTENSIONS:
+                            full_path = os.path.join(dirpath, fname)
+                            file_candidates.append((root_dir, full_path))
+            except Exception as walk_err:
+                print(f"[Scanner] Error accessing '{root_dir}': {walk_err}")
 
         total_files = len(file_candidates)
-        print(f"[Scanner] Found {total_files} potential image files to process.")
+        print(f"[Scanner] Discovered {total_files} potential image files.")
 
-        # Second pass: extract metadata with cache check
+        # Process each image candidate
         for root_dir, file_path in file_candidates:
             if self.is_cancelled:
                 print("[Scanner] Scan cancelled by user.")
@@ -89,7 +110,10 @@ class FolderScanner:
             # Extract basic file attributes
             fname = os.path.basename(file_path)
             ext = os.path.splitext(fname)[1].lower()
-            rel_path = os.path.relpath(file_path, root_dir)
+            try:
+                rel_path = os.path.relpath(file_path, root_dir)
+            except ValueError:
+                rel_path = fname
 
             width = 0
             height = 0
@@ -100,7 +124,6 @@ class FolderScanner:
 
             try:
                 with Image.open(file_path) as img:
-                    # Auto-orient based on EXIF tag
                     try:
                         img = ImageOps.exif_transpose(img)
                     except Exception:
@@ -114,7 +137,6 @@ class FolderScanner:
                         thumb = img.copy()
                         thumb.thumbnail((256, 256), Image.Resampling.LANCZOS)
                         if thumb.mode in ("RGBA", "LA", "P"):
-                            # Convert to RGB with white background if saving webp/jpeg
                             background = Image.new("RGB", thumb.size, (255, 255, 255))
                             background.paste(thumb, mask=thumb.split()[-1] if thumb.mode == "RGBA" else None)
                             thumb = background
@@ -130,12 +152,11 @@ class FolderScanner:
                         dhash_str = str(dhash_val)
 
             except Exception as img_err:
-                # Corrupted or unreadable image file
                 is_corrupt = True
-                print(f"[Scanner] Unreadable image '{file_path}': {img_err}")
+                print(f"[Scanner] Notice: Problem decoding '{file_path}': {img_err}")
 
             metadata: Dict[str, Any] = {
-                "id": self.cache.get_thumbnail_path(file_path).split(os.sep)[-1].replace(".webp", ""),
+                "id": os.path.splitext(os.path.basename(thumbnail_path))[0],
                 "filename": fname,
                 "path": file_path,
                 "relative_path": rel_path,

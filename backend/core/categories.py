@@ -1,7 +1,18 @@
 import os
 import cv2
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+def cv2_imread_safe(image_path: str) -> Optional[np.ndarray]:
+    """Safe image reader handling Windows Unicode/non-ASCII paths seamlessly."""
+    try:
+        with open(image_path, "rb") as f:
+            chunk = f.read()
+        arr = np.frombuffer(chunk, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        print(f"[Categories] cv2_imread_safe error on {image_path}: {e}")
+        return None
 
 CATEGORIES = [
     "People",
@@ -41,7 +52,7 @@ class LocalCategorizer:
         ext = photo.get("extension", "").lower()
         fname = photo.get("filename", "").lower()
 
-        # 1. Screenshot detection: PNG format, exact standard screen resolutions, or filename clues
+        # 1. Screenshot detection
         screen_ratios = [16/9, 16/10, 19.5/9, 20/9, 4/3]
         if w > 0 and h > 0:
             aspect = max(w, h) / min(w, h)
@@ -49,13 +60,12 @@ class LocalCategorizer:
             if ("screenshot" in fname or "screen_shot" in fname or "capture" in fname) or (ext == ".png" and is_screen_ratio and (w in (1920, 2560, 3840, 1080, 1280) or h in (1920, 2560, 3840, 1080, 1280))):
                 tags.append("Screenshots")
 
-        # 2. People & Family / Group photos analysis based on detected faces
+        # 2. People & Family / Group photos
         detected_faces = faces if faces is not None else photo.get("faces", [])
         face_count = len(detected_faces)
 
         if face_count == 1:
             tags.append("People")
-            # If the face covers > 15% of the image area, it's a selfie / close portrait
             box = detected_faces[0].get("box", [0, 0, 0, 0])
             face_area = box[2] * box[3]
             img_area = max(1, w * h)
@@ -65,29 +75,23 @@ class LocalCategorizer:
             tags.append("People")
             tags.append("Family/Group Photos")
 
-        # 3. Computer Vision Color & Edge Analysis (HSV Color Histograms)
+        # 3. Computer Vision Color & Edge Analysis
         try:
-            # Load downsampled image for fast analysis (~160x160)
-            img = cv2.imread(image_path)
+            img = cv2_imread_safe(image_path)
             if img is not None:
                 small = cv2.resize(img, (160, 160))
                 hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
                 gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-                # Color masks
-                # Green (Nature/Foliage): Hue 35 to 85
                 green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
                 green_ratio = np.count_nonzero(green_mask) / (160 * 160)
 
-                # Blue (Sky/Water/Beach): Hue 90 to 135
                 blue_mask = cv2.inRange(hsv, (90, 50, 50), (135, 255, 255))
                 blue_ratio = np.count_nonzero(blue_mask) / (160 * 160)
 
-                # Warm / Red-Orange-Yellow (Food / Sunset / Warm events): Hue 0-25
                 warm_mask = cv2.inRange(hsv, (0, 70, 70), (25, 255, 255))
                 warm_ratio = np.count_nonzero(warm_mask) / (160 * 160)
 
-                # Document detection: High contrast, mostly white/light background with dark text
                 edges = cv2.Canny(gray, 50, 150)
                 edge_density = np.count_nonzero(edges) / (160 * 160)
                 white_pixels = np.count_nonzero(gray > 200) / (160 * 160)
@@ -111,8 +115,7 @@ class LocalCategorizer:
         except Exception as e:
             print(f"[Categorizer] Error reading visual features for {image_path}: {e}")
 
-        # Fallback if no specific category matched
         if not tags:
             tags.append("Other")
 
-        return list(dict.fromkeys(tags)) # Return unique tags
+        return list(dict.fromkeys(tags))
