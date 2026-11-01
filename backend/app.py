@@ -445,6 +445,9 @@ def serve_frontend(path="index.html"):
     src_dir = get_resource_path("src")
     if os.path.exists(os.path.join(src_dir, path)):
         return static_file(path, root=src_dir)
+    assets_dir = get_resource_path("assets")
+    if path.startswith("assets/") and os.path.exists(os.path.join(assets_dir, path.replace("assets/", "", 1))):
+        return static_file(path.replace("assets/", "", 1), root=assets_dir)
     return static_file("index.html", root=dist_dir if os.path.exists(dist_dir) else src_dir)
 
 def run_desktop_app(port: Optional[int] = None):
