@@ -21,10 +21,14 @@ class FaceEngine:
     Runs 100% on CPU without cloud dependencies.
     """
 
-    def __init__(self, models_dir: str = "assets/models"):
-        self.models_dir = models_dir
-        self.yunet_path = os.path.join(models_dir, "face_detection_yunet_2023mar.onnx")
-        self.sface_path = os.path.join(models_dir, "face_recognition_sface_2021dec.onnx")
+    def __init__(self, models_dir: Optional[str] = None):
+        if not models_dir:
+            from .utils import get_resource_path
+            self.models_dir = get_resource_path("assets/models")
+        else:
+            self.models_dir = os.path.abspath(models_dir)
+        self.yunet_path = os.path.join(self.models_dir, "face_detection_yunet_2023mar.onnx")
+        self.sface_path = os.path.join(self.models_dir, "face_recognition_sface_2021dec.onnx")
         
         self.detector: Optional[Any] = None
         self.recognizer: Optional[Any] = None

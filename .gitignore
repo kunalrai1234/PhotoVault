@@ -39,6 +39,10 @@ thumbnails/
 cache.json
 *.log
 temp/
+build-app/
+dist-app/
+release/*.exe
+release/*.zip
 
 # OS Specific
 Thumbs.db

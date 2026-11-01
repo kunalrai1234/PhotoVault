@@ -132,24 +132,33 @@ class FolderScanner:
                     width, height = img.size
                     fmt = (img.format or fmt).upper()
 
-                    # Generate thumbnail if missing
-                    if not has_thumbnail:
-                        thumb = img.copy()
-                        thumb.thumbnail((256, 256), Image.Resampling.LANCZOS)
-                        if thumb.mode in ("RGBA", "LA", "P"):
-                            background = Image.new("RGB", thumb.size, (255, 255, 255))
-                            background.paste(thumb, mask=thumb.split()[-1] if thumb.mode == "RGBA" else None)
-                            thumb = background
-                        elif thumb.mode != "RGB":
-                            thumb = thumb.convert("RGB")
-                        thumb.save(thumbnail_path, "WEBP", quality=80)
-
                     # Perceptual hashes
                     if extract_phash and (not phash_str or not dhash_str):
-                        phash_val = imagehash.phash(img)
-                        dhash_val = imagehash.dhash(img)
-                        phash_str = str(phash_val)
-                        dhash_str = str(dhash_val)
+                        try:
+                            phash_val = imagehash.phash(img)
+                            dhash_val = imagehash.dhash(img)
+                            phash_str = str(phash_val)
+                            dhash_str = str(dhash_val)
+                        except Exception as h_err:
+                            print(f"[Scanner] Warning: Hash generation failed for {file_path}: {h_err}")
+
+                    # Generate thumbnail if missing
+                    if not has_thumbnail:
+                        try:
+                            thumb = img.copy()
+                            thumb.thumbnail((256, 256), Image.Resampling.LANCZOS)
+                            if thumb.mode in ("RGBA", "LA", "P"):
+                                background = Image.new("RGB", thumb.size, (255, 255, 255))
+                                background.paste(thumb, mask=thumb.split()[-1] if thumb.mode == "RGBA" else None)
+                                thumb = background
+                            elif thumb.mode != "RGB":
+                                thumb = thumb.convert("RGB")
+                            try:
+                                thumb.save(thumbnail_path, "WEBP", quality=80)
+                            except Exception:
+                                thumb.save(thumbnail_path.replace(".webp", ".jpg"), "JPEG", quality=80)
+                        except Exception as thumb_err:
+                            print(f"[Scanner] Warning: Thumbnail generation failed for {file_path}: {thumb_err}")
 
             except Exception as img_err:
                 is_corrupt = True

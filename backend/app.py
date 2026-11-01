@@ -1,13 +1,21 @@
 import os
 import sys
 import json
+import socket
 import argparse
-from typing import Dict, Any, List
-from bottle import Bottle, request, response, static_file, run
+import threading
+import time
+from typing import Dict, Any, List, Optional
+from wsgiref.simple_server import WSGIServer, make_server
+from socketserver import ThreadingMixIn
+from bottle import Bottle, request, response, static_file, run, ServerAdapter
 
 # Ensure backend directory is in sys.path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
 
+from core.utils import get_resource_path, find_available_port
 from core.cache import MetadataCache
 from core.scanner import FolderScanner, sanitize_folder_path
 from core.duplicates import ExactDuplicateEngine
@@ -20,12 +28,13 @@ from adapters.gemini_adapter import GeminiAdapter
 from adapters.openai_adapter import OpenAIAdapter
 from adapters.claude_adapter import ClaudeAdapter
 
-# Initialize singletons
-cache = MetadataCache(cache_dir=".photovault_cache")
+# Initialize singletons with robust path resolution
+cache = MetadataCache()
 scanner = FolderScanner(cache=cache)
 duplicate_engine = ExactDuplicateEngine()
 similarity_engine = VisualSimilarityEngine()
-face_engine = FaceEngine(models_dir="assets/models")
+models_path = get_resource_path("assets/models")
+face_engine = FaceEngine(models_dir=models_path)
 categorizer = LocalCategorizer()
 organizer = SafeOrganizer()
 
@@ -36,13 +45,38 @@ state: Dict[str, Any] = {
     "duplicate_groups": [],
     "similarity_groups": [],
     "face_clusters": [],
-    "scan_progress": {"current": 0, "total": 0, "status": "idle"},
+    "scan_progress": {
+        "current": 0,
+        "total": 0,
+        "status": "idle",
+        "active": False,
+        "phase": "idle"
+    },
     "ai_settings": {
         "gemini": {"enabled": False, "model": "gemini-3.5-flash"},
         "openai": {"enabled": False, "model": "gpt-4o", "base_url": "https://api.openai.com/v1"},
         "claude": {"enabled": False, "model": "claude-3-5-sonnet-20241022"}
     }
 }
+
+# Scan background lock
+scan_lock = threading.Lock()
+
+# Multi-threaded WSGI Server for Bottle
+class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+class ThreadedServer(ServerAdapter):
+    server_instance: Optional[WSGIServer] = None
+
+    def run(self, handler):
+        self.server_instance = make_server(self.host, self.port, handler, server_class=ThreadedWSGIServer)
+        self.server_instance.serve_forever()
+
+    def shutdown(self):
+        if self.server_instance:
+            self.server_instance.shutdown()
 
 app = Bottle()
 
@@ -90,9 +124,90 @@ def get_status():
         "scan_progress": state["scan_progress"]
     }
 
-# 3. Folder Selection & Scanning
+# 3. Asynchronous Folder Scanning Engine
+def _run_scan_thread(folders: List[str]):
+    with scan_lock:
+        state["scan_progress"]["active"] = True
+        state["scan_progress"]["phase"] = "scanning"
+        state["scan_progress"]["current"] = 0
+        state["scan_progress"]["total"] = 0
+        state["scan_progress"]["status"] = "Discovering photos..."
+
+        def on_progress(current: int, path: str):
+            state["scan_progress"]["current"] = current
+            state["scan_progress"]["status"] = f"Reading {os.path.basename(path)}"
+
+        try:
+            # 1. Recursive scan & thumbnail extraction
+            photos = scanner.scan_paths(folders, progress_callback=on_progress)
+            total_photos = len(photos)
+            state["scan_progress"]["total"] = total_photos
+
+            if scanner.is_cancelled:
+                state["scan_progress"]["status"] = "Scan cancelled"
+                state["scan_progress"]["active"] = False
+                state["scan_progress"]["phase"] = "cancelled"
+                return
+
+            # 2. Extract faces and categories
+            state["scan_progress"]["phase"] = "analyzing"
+            for idx, photo in enumerate(photos):
+                if scanner.is_cancelled:
+                    break
+                state["scan_progress"]["status"] = f"Analyzing faces & visual features ({idx + 1}/{total_photos})"
+                state["scan_progress"]["current"] = idx + 1
+                try:
+                    faces = face_engine.detect_faces(photo["path"])
+                    photo["faces"] = faces
+                    photo["tags"] = categorizer.categorize_image(photo, faces=faces)
+                    cache.put(photo["path"], photo)
+                except Exception as e:
+                    print(f"[Scan] Error analyzing {photo['path']}: {e}")
+
+            if scanner.is_cancelled:
+                state["scan_progress"]["status"] = "Scan cancelled"
+                state["scan_progress"]["active"] = False
+                state["scan_progress"]["phase"] = "cancelled"
+                return
+
+            cache.save()
+            state["photos"] = photos
+
+            # 3. Exact duplicates
+            state["scan_progress"]["status"] = "Detecting duplicate groups..."
+            state["duplicate_groups"] = duplicate_engine.find_duplicates(photos)
+
+            # 4. Visual similarity
+            state["scan_progress"]["status"] = "Clustering visually similar & burst photos..."
+            state["similarity_groups"] = similarity_engine.find_similar_groups(photos, mode="balanced")
+
+            # 5. Face clusters
+            state["scan_progress"]["status"] = "Clustering person albums..."
+            state["face_clusters"] = face_engine.cluster_faces()
+
+            state["scan_progress"] = {
+                "current": total_photos,
+                "total": total_photos,
+                "status": f"Scan completed ({total_photos} photos indexed)",
+                "active": False,
+                "phase": "completed"
+            }
+
+        except Exception as e:
+            print(f"[Scan] Fatal error during scan: {e}")
+            state["scan_progress"] = {
+                "current": 0,
+                "total": 0,
+                "status": f"Scan error: {e}",
+                "active": False,
+                "phase": "error"
+            }
+
 @app.route('/api/scan', method='POST')
 def start_scan():
+    if state["scan_progress"]["active"]:
+        return {"status": "busy", "message": "A scan is already in progress"}
+
     data = request.json or {}
     raw_folders = data.get("folders", [])
     if not raw_folders:
@@ -111,49 +226,23 @@ def start_scan():
         return {"error": "None of the specified folders exist on this computer."}
 
     state["scanned_folders"] = folders
-    state["scan_progress"] = {"current": 0, "total": 0, "status": "scanning"}
+    scanner.is_cancelled = False
 
-    def on_progress(current: int, path: str):
-        state["scan_progress"]["current"] = current
-        state["scan_progress"]["status"] = f"Scanning {os.path.basename(path)}"
+    # Launch in non-blocking background thread
+    worker = threading.Thread(target=_run_scan_thread, args=(folders,), daemon=True)
+    worker.start()
 
-    # 1. Recursive scan & thumbnail extraction
-    photos = scanner.scan_paths(folders, progress_callback=on_progress)
-    
-    # 2. Extract faces and categories safely
-    for idx, photo in enumerate(photos):
-        try:
-            faces = face_engine.detect_faces(photo["path"])
-            photo["faces"] = faces
-            photo["tags"] = categorizer.categorize_image(photo, faces=faces)
-            cache.put(photo["path"], photo)
-        except Exception as e:
-            print(f"[Scan] Error analyzing {photo['path']}: {e}")
-
-    cache.save()
-    state["photos"] = photos
-
-    # 3. Exact duplicates
-    state["duplicate_groups"] = duplicate_engine.find_duplicates(photos)
-
-    # 4. Visual similarity
-    state["similarity_groups"] = similarity_engine.find_similar_groups(photos, mode="balanced")
-
-    # 5. Face clusters
-    state["face_clusters"] = face_engine.cluster_faces()
-
-    state["scan_progress"] = {"current": len(photos), "total": len(photos), "status": "completed"}
     return {
-        "total_scanned": len(photos),
-        "duplicate_groups": len(state["duplicate_groups"]),
-        "similarity_groups": len(state["similarity_groups"]),
-        "face_clusters": len(state["face_clusters"])
+        "status": "started",
+        "message": f"Scan started for {len(folders)} folder(s)"
     }
 
 @app.route('/api/scan/cancel', method='POST')
 def cancel_scan():
     scanner.cancel()
-    state["scan_progress"]["status"] = "cancelled"
+    state["scan_progress"]["status"] = "Cancelling scan..."
+    state["scan_progress"]["active"] = False
+    state["scan_progress"]["phase"] = "cancelled"
     return {"status": "cancelled"}
 
 # 4. Photos List & Filtering
@@ -334,8 +423,7 @@ def test_ai_connection():
 # 12. Thumbnail & Local File Serving
 @app.route('/thumbnail/<path:path>')
 def serve_thumbnail(path):
-    cache_dir = os.path.abspath(".photovault_cache/thumbnails")
-    return static_file(path, root=cache_dir)
+    return static_file(path, root=cache.thumbnails_dir)
 
 @app.route('/local-image/<path:path>')
 def serve_local_image(path):
@@ -351,51 +439,89 @@ def serve_local_image(path):
 @app.route('/')
 @app.route('/<path:path>')
 def serve_frontend(path="index.html"):
-    dist_dir = os.path.abspath("dist")
+    dist_dir = get_resource_path("dist")
     if os.path.exists(os.path.join(dist_dir, path)):
         return static_file(path, root=dist_dir)
-    src_dir = os.path.abspath("src")
+    src_dir = get_resource_path("src")
     if os.path.exists(os.path.join(src_dir, path)):
         return static_file(path, root=src_dir)
-    return static_file("index.html", root=src_dir)
+    return static_file("index.html", root=dist_dir if os.path.exists(dist_dir) else src_dir)
 
-def run_desktop_app():
+def run_desktop_app(port: Optional[int] = None):
     import webview
-    import threading
+
+    active_port = port if port else find_available_port(54321)
+    server_adapter = ThreadedServer(host="127.0.0.1", port=active_port)
 
     server_thread = threading.Thread(
-        target=lambda: run(app, host="127.0.0.1", port=54321, quiet=True),
+        target=lambda: run(app, server=server_adapter, quiet=True),
         daemon=True
     )
     server_thread.start()
 
+    # Small delay for socket listener to attach
+    time.sleep(0.3)
+
     class DesktopAPI:
         def select_folder(self):
-            window = webview.windows[0]
-            result = window.create_file_dialog(webview.FOLDER_DIALOG)
-            if result and len(result) > 0:
-                return result[0]
+            try:
+                window = webview.windows[0]
+                result = window.create_file_dialog(webview.FOLDER_DIALOG)
+                if result and len(result) > 0:
+                    return result[0]
+            except Exception:
+                pass
             return None
 
     api = DesktopAPI()
-    window = webview.create_window(
-        title="PhotoVault Local AI",
-        url="http://127.0.0.1:54321",
-        width=1280,
-        height=820,
-        min_size=(1024, 700),
-        js_api=api
-    )
-    webview.start(debug=False)
+    icon_path = get_resource_path("assets/icon.ico")
+    if not os.path.exists(icon_path):
+        icon_path = None
+
+    try:
+        window = webview.create_window(
+            title="PhotoVault Local AI",
+            url=f"http://127.0.0.1:{active_port}",
+            width=1280,
+            height=820,
+            min_size=(1024, 700),
+            js_api=api
+        )
+
+        def on_closed():
+            # Ensure clean exit and no orphaned threads or processes
+            try:
+                server_adapter.shutdown()
+            except Exception:
+                pass
+            os._exit(0)
+
+        window.events.closed += on_closed
+        webview.start(debug=False)
+    except Exception as e:
+        print(f"[PhotoVault] Desktop GUI failed to launch: {e}")
+        import webbrowser
+        webbrowser.open(f"http://127.0.0.1:{active_port}")
+        while True:
+            time.sleep(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PhotoVault Local AI")
     parser.add_argument("--desktop", action="store_true", help="Launch native desktop window")
-    parser.add_argument("--port", type=int, default=54321, help="Server port (default: 54321)")
+    parser.add_argument("--server", action="store_true", help="Launch headless API server only")
+    parser.add_argument("--port", type=int, default=None, help="Server port (auto-allocated if omitted)")
     args = parser.parse_args()
 
-    if args.desktop:
-        run_desktop_app()
+    # If --server is explicitly requested, run headless server
+    # Otherwise (e.g. double-click in explorer, desktop shortcut), default to native GUI
+    if args.server:
+        launch_gui = False
     else:
-        print(f"[PhotoVault] Starting local API server at http://127.0.0.1:{args.port}...")
-        run(app, host="127.0.0.1", port=args.port, reloader=False)
+        launch_gui = True
+
+    if launch_gui:
+        run_desktop_app(port=args.port)
+    else:
+        active_port = args.port if args.port else find_available_port(54321)
+        print(f"[PhotoVault] Starting local multi-threaded API server at http://127.0.0.1:{active_port}...")
+        run(app, server=ThreadedServer, host="127.0.0.1", port=active_port, reloader=False)

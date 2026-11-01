@@ -23,6 +23,16 @@
     </div>
   </header>
 
+  <!-- Realtime Scan Progress Bar -->
+  <div id="scan-progress-bar-container" style="display:none; background:var(--bg-secondary); border-bottom:1px solid var(--border-color); padding: 8px 16px; align-items:center; gap:12px; font-size:12px;">
+    <span id="scan-progress-label" style="font-weight:600; color:var(--accent); min-width:200px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Scanning in progress...</span>
+    <div style="flex:1; background:var(--bg-tertiary); height:8px; border-radius:4px; overflow:hidden;">
+      <div id="scan-progress-fill" style="width:0%; height:100%; background:var(--accent); transition:width 0.2s;"></div>
+    </div>
+    <span id="scan-progress-count" style="color:var(--text-dim); font-family:monospace; min-width:45px; text-align:right;">0%</span>
+    <button class="btn btn-danger" id="btn-cancel-scan" style="padding:2px 8px; font-size:11px;">Cancel Scan</button>
+  </div>
+
   <!-- Main Container -->
   <div class="app-container">
     <!-- Left Navigation Sidebar -->

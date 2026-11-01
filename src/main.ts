@@ -1,5 +1,18 @@
 // PhotoVault Local AI Frontend Application
-const API_BASE = "http://127.0.0.1:54321/api";
+
+function getApiBase(): string {
+  if (typeof window !== "undefined" && window.location && window.location.protocol.startsWith("http")) {
+    return `${window.location.origin}/api`;
+  }
+  return "http://127.0.0.1:54321/api";
+}
+
+function getThumbnailUrl(id: string): string {
+  if (typeof window !== "undefined" && window.location && window.location.protocol.startsWith("http")) {
+    return `${window.location.origin}/thumbnail/${id}.webp`;
+  }
+  return `http://127.0.0.1:54321/thumbnail/${id}.webp`;
+}
 
 interface Photo {
   id: string;
@@ -62,6 +75,7 @@ class PhotoVaultApp {
   private similarityGroups: SimilarityGroup[] = [];
   private faceClusters: FaceCluster[] = [];
   private scannedFolders: string[] = [];
+  private pollInterval: any = null;
 
   constructor() {
     this.initEventListeners();
@@ -90,6 +104,7 @@ class PhotoVaultApp {
     document.getElementById("btn-scan")?.addEventListener("click", () => this.runScan());
     document.getElementById("btn-organize")?.addEventListener("click", () => this.showOrganizeModal());
     document.getElementById("btn-ai-settings")?.addEventListener("click", () => this.showAISettingsModal());
+    document.getElementById("btn-cancel-scan")?.addEventListener("click", () => this.cancelScan());
 
     // Toolbar
     const searchInput = document.getElementById("input-search") as HTMLInputElement;
@@ -102,15 +117,28 @@ class PhotoVaultApp {
     sortSelect?.addEventListener("change", () => this.sortPhotos(sortSelect.value));
   }
 
-  private async refreshStatus() {
+  public async refreshStatus() {
     try {
-      const res = await fetch(`${API_BASE}/status`);
+      const res = await fetch(`${getApiBase()}/status`);
       if (res.ok) {
         const data = await res.json();
-        document.getElementById("badge-total-photos")!.innerText = data.total_photos;
-        document.getElementById("badge-duplicates")!.innerText = data.duplicate_groups_count;
-        document.getElementById("badge-similar")!.innerText = data.similarity_groups_count;
-        document.getElementById("badge-faces")!.innerText = data.face_clusters_count;
+        const totalPhotosEl = document.getElementById("badge-total-photos");
+        const dupsEl = document.getElementById("badge-duplicates");
+        const simEl = document.getElementById("badge-similar");
+        const facesEl = document.getElementById("badge-faces");
+
+        if (totalPhotosEl) totalPhotosEl.innerText = String(data.total_photos);
+        if (dupsEl) dupsEl.innerText = String(data.duplicate_groups_count);
+        if (simEl) simEl.innerText = String(data.similarity_groups_count);
+        if (facesEl) facesEl.innerText = String(data.face_clusters_count);
+
+        // Check if a background scan is active
+        if (data.scan_progress && data.scan_progress.active) {
+          this.showProgressBar(data.scan_progress);
+          if (!this.pollInterval) {
+            this.startScanPolling();
+          }
+        }
       }
     } catch (e) {
       console.warn("Backend server not yet ready, retrying...", e);
@@ -119,7 +147,7 @@ class PhotoVaultApp {
 
   private async loadPhotos() {
     try {
-      const res = await fetch(`${API_BASE}/photos`);
+      const res = await fetch(`${getApiBase()}/photos`);
       if (res.ok) {
         const data = await res.json();
         this.photos = data.photos || [];
@@ -131,7 +159,7 @@ class PhotoVaultApp {
     }
   }
 
-  private switchView(viewName: string) {
+  public switchView(viewName: string) {
     this.currentView = viewName;
     document.querySelectorAll(".nav-item").forEach((el) => {
       el.classList.toggle("active", el.getAttribute("data-view") === viewName);
@@ -180,19 +208,19 @@ class PhotoVaultApp {
         </div>
 
         <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:16px;">
-          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px;">
+          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px; cursor:pointer;" onclick="app.switchView('all-photos')">
             <div style="color:var(--text-dim); font-size:12px;">TOTAL INDEXED PHOTOS</div>
             <div style="font-size:28px; font-weight:700; margin-top:4px;">${this.photos.length}</div>
           </div>
-          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px;">
+          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px; cursor:pointer;" onclick="app.switchView('exact-duplicates')">
             <div style="color:var(--text-dim); font-size:12px;">EXACT DUPLICATE GROUPS</div>
             <div style="font-size:28px; font-weight:700; margin-top:4px; color:var(--warning);">${this.duplicateGroups.length}</div>
           </div>
-          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px;">
+          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px; cursor:pointer;" onclick="app.switchView('similar-photos')">
             <div style="color:var(--text-dim); font-size:12px;">SIMILAR BURST GROUPS</div>
             <div style="font-size:28px; font-weight:700; margin-top:4px; color:var(--accent);">${this.similarityGroups.length}</div>
           </div>
-          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px;">
+          <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); padding:16px; cursor:pointer;" onclick="app.switchView('faces')">
             <div style="color:var(--text-dim); font-size:12px;">FACE CLUSTERS</div>
             <div style="font-size:28px; font-weight:700; margin-top:4px; color:var(--success);">${this.faceClusters.length}</div>
           </div>
@@ -204,12 +232,24 @@ class PhotoVaultApp {
             this.scannedFolders.length === 0
               ? '<p style="color:var(--text-dim); font-size:13px;">No folders added yet. Click "Select Folder (Browse)" above to select your photos.</p>'
               : `<ul style="font-size:13px; list-style:none; display:flex; flex-direction:column; gap:6px;">
-                  ${this.scannedFolders.map((f) => `<li style="font-family:monospace; background:var(--bg-tertiary); padding:6px 10px; border-radius:var(--radius-sm);">📁 ${f}</li>`).join("")}
+                  ${this.scannedFolders.map((f, idx) => `
+                    <li style="display:flex; justify-content:space-between; align-items:center; background:var(--bg-tertiary); padding:6px 10px; border-radius:var(--radius-sm);">
+                      <span style="font-family:monospace;">📁 ${f}</span>
+                      <button class="btn" style="padding:2px 6px; font-size:11px;" onclick="app.removeFolder(${idx})">✕ Remove</button>
+                    </li>
+                  `).join("")}
                 </ul>`
           }
         </div>
       </div>
     `;
+  }
+
+  public removeFolder(index: number) {
+    if (index >= 0 && index < this.scannedFolders.length) {
+      this.scannedFolders.splice(index, 1);
+      this.renderCurrentView();
+    }
   }
 
   public addManualFolder() {
@@ -236,7 +276,7 @@ class PhotoVaultApp {
       const card = document.createElement("div");
       card.className = "photo-card" + (this.selectedPaths.has(photo.path) ? " selected" : "");
       
-      const thumbUrl = `http://127.0.0.1:54321/thumbnail/${photo.id}.webp`;
+      const thumbUrl = getThumbnailUrl(photo.id);
 
       card.innerHTML = `
         <div class="photo-thumb-wrap">
@@ -271,7 +311,7 @@ class PhotoVaultApp {
 
   private async renderDuplicatesView(root: HTMLElement) {
     root.innerHTML = `<div style="padding:20px; text-align:center; color:var(--text-dim);">Loading exact duplicate groups...</div>`;
-    const res = await fetch(`${API_BASE}/duplicates`);
+    const res = await fetch(`${getApiBase()}/duplicates`);
     if (!res.ok) return;
     const data = await res.json();
     this.duplicateGroups = data.groups || [];
@@ -303,7 +343,7 @@ class PhotoVaultApp {
           <div style="display:flex; gap:12px; overflow-x:auto; padding-bottom:8px;">
             ${group.photos.map((p) => {
               const isKeep = p.path === group.recommended_keep;
-              const thumb = `http://127.0.0.1:54321/thumbnail/${p.id}.webp`;
+              const thumb = getThumbnailUrl(p.id);
               return `
                 <div style="width:160px; flex-shrink:0; background:var(--bg-tertiary); border:1px solid ${isKeep ? 'var(--success)' : 'var(--border-subtle)'}; border-radius:var(--radius-sm); padding:6px;">
                   <img src="${thumb}" style="width:100%; height:120px; object-fit:cover; border-radius:var(--radius-sm);"/>
@@ -353,7 +393,7 @@ class PhotoVaultApp {
     const container = document.getElementById("similarity-groups-content");
     if (!container) return;
 
-    const res = await fetch(`${API_BASE}/similarity?mode=${mode}`);
+    const res = await fetch(`${getApiBase()}/similarity?mode=${mode}`);
     if (!res.ok) return;
     const data = await res.json();
     this.similarityGroups = data.groups || [];
@@ -370,7 +410,7 @@ class PhotoVaultApp {
           <div style="font-weight:600; font-size:14px; margin-bottom:10px;">${group.category} #${idx + 1} (${group.count} photos)</div>
           <div style="display:flex; gap:12px; overflow-x:auto;">
             ${group.photos.map((p) => {
-              const thumb = `http://127.0.0.1:54321/thumbnail/${p.id}.webp`;
+              const thumb = getThumbnailUrl(p.id);
               return `
                 <div style="width:140px; flex-shrink:0;">
                   <img src="${thumb}" style="width:100%; height:110px; object-fit:cover; border-radius:var(--radius-sm); border:1px solid var(--border-subtle);"/>
@@ -388,7 +428,7 @@ class PhotoVaultApp {
 
   private async renderFacesView(root: HTMLElement) {
     root.innerHTML = `<div style="padding:20px; text-align:center; color:var(--text-dim);">Loading face clusters...</div>`;
-    const res = await fetch(`${API_BASE}/faces`);
+    const res = await fetch(`${getApiBase()}/faces`);
     if (!res.ok) return;
     const data = await res.json();
     this.faceClusters = data.clusters || [];
@@ -413,7 +453,7 @@ class PhotoVaultApp {
 
     this.faceClusters.forEach((cluster) => {
       const rep = cluster.faces[0];
-      const thumb = rep ? `http://127.0.0.1:54321/thumbnail/${rep.face_id.split('_face_')[0]}.webp` : '';
+      const thumb = rep ? getThumbnailUrl(rep.face_id.split('_face_')[0]) : '';
       html += `
         <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); overflow:hidden; padding:12px;">
           <div style="width:100%; height:160px; background:var(--bg-tertiary); border-radius:var(--radius-sm); overflow:hidden; display:flex; align-items:center; justify-content:center;">
@@ -452,7 +492,7 @@ class PhotoVaultApp {
 
     Object.entries(categoryMap).forEach(([catName, pList]) => {
       const rep = pList[0];
-      const thumb = rep ? `http://127.0.0.1:54321/thumbnail/${rep.id}.webp` : '';
+      const thumb = rep ? getThumbnailUrl(rep.id) : '';
       html += `
         <div style="background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-md); overflow:hidden; cursor:pointer;" onclick="app.filterByCategory('${catName}')">
           <div style="width:100%; height:130px; background:var(--bg-tertiary); overflow:hidden;">
@@ -506,7 +546,7 @@ class PhotoVaultApp {
     this.selectedPhoto = photo;
     const preview = document.getElementById("inspector-preview");
     if (preview) {
-      const thumb = `http://127.0.0.1:54321/thumbnail/${photo.id}.webp`;
+      const thumb = getThumbnailUrl(photo.id);
       preview.innerHTML = `<img src="${thumb}" alt="${photo.filename}"/>`;
     }
 
@@ -548,7 +588,7 @@ class PhotoVaultApp {
     if (descEl) descEl.innerText = "Analyzing with Google Gemini (gemini-3.5-flash)...";
 
     try {
-      const res = await fetch(`${API_BASE}/ai/describe`, {
+      const res = await fetch(`${getApiBase()}/ai/describe`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image_path: imagePath })
@@ -557,7 +597,7 @@ class PhotoVaultApp {
       if (data.success && descEl) {
         descEl.innerHTML = `<strong>Gemini Vision:</strong><br/>${data.analysis}`;
       } else if (descEl) {
-        descEl.innerText = `Error: ${data.error || "Failed to analyze"}`;
+        descEl.innerText = `Notice: ${data.error || "Please configure your Gemini API Key in AI Settings first."}`;
       }
     } catch (e: any) {
       if (descEl) descEl.innerText = `Error: ${e.message}`;
@@ -569,9 +609,8 @@ class PhotoVaultApp {
   public async promptAddFolder() {
     let folderPath: string | null = null;
     
-    // First try the native Windows Folder Picker API on the backend
     try {
-      const res = await fetch(`${API_BASE}/pick-folder`, { method: "POST" });
+      const res = await fetch(`${getApiBase()}/pick-folder`, { method: "POST" });
       if (res.ok) {
         const data = await res.json();
         if (data.folder) {
@@ -582,7 +621,6 @@ class PhotoVaultApp {
       console.warn("Backend pick-folder failed, trying pywebview/prompt", e);
     }
 
-    // Fallback if dialog cancelled or not opened
     if (!folderPath) {
       if ((window as any).pywebview && (window as any).pywebview.api) {
         folderPath = await (window as any).pywebview.api.select_folder();
@@ -609,28 +647,88 @@ class PhotoVaultApp {
       return;
     }
 
-    const statusText = document.getElementById("scan-status-text");
-    if (statusText) statusText.innerText = "Scanning in progress...";
-
     try {
-      const res = await fetch(`${API_BASE}/scan`, {
+      const res = await fetch(`${getApiBase()}/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ folders: this.scannedFolders })
       });
       if (res.ok) {
         const data = await res.json();
-        if (statusText) statusText.innerText = `Scan complete (${data.total_scanned} photos)`;
-        await this.loadPhotos();
-        this.switchView("all-photos");
+        if (data.status === "started" || data.status === "busy") {
+          this.startScanPolling();
+        }
       } else {
         const err = await res.json();
         alert(`Scan failed: ${err.error || "Unknown error"}`);
-        if (statusText) statusText.innerText = "Scan failed";
       }
     } catch (e: any) {
-      if (statusText) statusText.innerText = "Scan error";
       alert(`Could not connect to scan engine: ${e.message}`);
+    }
+  }
+
+  private startScanPolling() {
+    if (this.pollInterval) clearInterval(this.pollInterval);
+
+    this.pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${getApiBase()}/status`);
+        if (res.ok) {
+          const data = await res.json();
+          const prog = data.scan_progress;
+          
+          if (prog && prog.active) {
+            this.showProgressBar(prog);
+          } else {
+            // Scan finished or cancelled
+            clearInterval(this.pollInterval);
+            this.pollInterval = null;
+            this.hideProgressBar(prog ? prog.status : "Scan complete");
+            await this.loadPhotos();
+            if (this.currentView === "dashboard" && this.photos.length > 0) {
+              this.switchView("all-photos");
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Polling error:", err);
+      }
+    }, 400);
+  }
+
+  private showProgressBar(prog: any) {
+    const container = document.getElementById("scan-progress-bar-container");
+    const label = document.getElementById("scan-progress-label");
+    const fill = document.getElementById("scan-progress-fill");
+    const count = document.getElementById("scan-progress-count");
+    const statusText = document.getElementById("scan-status-text");
+
+    if (container) container.style.display = "flex";
+    if (label) label.innerText = prog.status || "Scanning...";
+    if (statusText) statusText.innerText = prog.status || "Scanning...";
+
+    const current = prog.current || 0;
+    const total = prog.total || 0;
+    const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+
+    if (fill) fill.style.width = `${pct}%`;
+    if (count) count.innerText = total > 0 ? `${pct}% (${current}/${total})` : `${current}`;
+  }
+
+  private hideProgressBar(finalMessage: string) {
+    const container = document.getElementById("scan-progress-bar-container");
+    const statusText = document.getElementById("scan-status-text");
+    if (container) container.style.display = "none";
+    if (statusText) statusText.innerText = finalMessage;
+  }
+
+  public async cancelScan() {
+    try {
+      await fetch(`${getApiBase()}/scan/cancel`, { method: "POST" });
+      const label = document.getElementById("scan-progress-label");
+      if (label) label.innerText = "Cancelling scan...";
+    } catch (e) {
+      console.error("Cancel failed:", e);
     }
   }
 
@@ -682,7 +780,7 @@ class PhotoVaultApp {
     const strategy = (document.getElementById("org-strategy") as HTMLSelectElement).value;
     const action = (document.getElementById("org-action") as HTMLSelectElement).value;
 
-    const res = await fetch(`${API_BASE}/organize/plan`, {
+    const res = await fetch(`${getApiBase()}/organize/plan`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ target_root: target, group_by: strategy, action })
@@ -709,7 +807,7 @@ class PhotoVaultApp {
     const plan = (window as any)._currentPlan;
     if (!plan) return;
 
-    const res = await fetch(`${API_BASE}/organize/execute`, {
+    const res = await fetch(`${getApiBase()}/organize/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ plan })
@@ -740,7 +838,6 @@ class PhotoVaultApp {
               <div style="border:1px solid var(--border-color); border-radius:var(--radius-md); padding:12px;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                   <div style="font-weight:600; font-size:13px;">Google Gemini (Active: gemini-3.5-flash)</div>
-                  <span class="badge" style="background:var(--success); color:white;">Configured ✓</span>
                 </div>
                 <div style="display:flex; gap:8px; margin-top:8px;">
                   <input type="password" id="key-gemini" placeholder="Enter your Gemini API Key" class="btn" style="flex:1; text-align:left;"/>
@@ -771,7 +868,7 @@ class PhotoVaultApp {
     const input = document.getElementById(`key-${provider}`) as HTMLInputElement;
     if (!input || !input.value) return;
 
-    const res = await fetch(`${API_BASE}/ai/save-key`, {
+    const res = await fetch(`${getApiBase()}/ai/save-key`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, api_key: input.value, enabled: true })
@@ -779,11 +876,12 @@ class PhotoVaultApp {
 
     if (res.ok) {
       alert(`${provider.toUpperCase()} key securely stored in Windows Credential Vault!`);
+      input.value = "";
     }
   }
 
   public async testKey(provider: string) {
-    const res = await fetch(`${API_BASE}/ai/test-connection`, {
+    const res = await fetch(`${getApiBase()}/ai/test-connection`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider })
@@ -805,7 +903,7 @@ class PhotoVaultApp {
       return;
     }
 
-    const res = await fetch(`${API_BASE}/cleanup/recycle`, {
+    const res = await fetch(`${getApiBase()}/cleanup/recycle`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ files: group.suggested_redundant })
@@ -825,7 +923,7 @@ class PhotoVaultApp {
       return;
     }
 
-    const res = await fetch(`${API_BASE}/cleanup/recycle`, {
+    const res = await fetch(`${getApiBase()}/cleanup/recycle`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ files: allRedundant })
@@ -840,7 +938,7 @@ class PhotoVaultApp {
   public async renamePersonPrompt(clusterId: string, currentName: string) {
     const newName = prompt("Enter new name for this person:", currentName);
     if (newName && newName.trim() && newName !== currentName) {
-      await fetch(`${API_BASE}/faces/rename`, {
+      await fetch(`${getApiBase()}/faces/rename`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cluster_id: clusterId, name: newName.trim() })
@@ -896,7 +994,7 @@ class PhotoVaultApp {
     const list = Array.from(this.selectedPaths);
     if (!confirm(`Move ${list.length} selected photos to Windows Recycle Bin?`)) return;
 
-    const res = await fetch(`${API_BASE}/cleanup/recycle`, {
+    const res = await fetch(`${getApiBase()}/cleanup/recycle`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ files: list })

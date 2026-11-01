@@ -3,6 +3,28 @@ import json
 import hashlib
 from typing import Dict, Any, Optional
 
+def get_default_cache_dir() -> str:
+    """
+    Determines the appropriate cache directory based on runtime mode:
+    - If PHOTOVAULT_DATA_DIR environment variable is set, uses that.
+    - If a local 'portable.flag' exists, uses local '.photovault_cache'.
+    - On Windows, uses '%LOCALAPPDATA%\\PhotoVault' to ensure write permissions
+      even when installed in 'Program Files'.
+    - Fallback: '.photovault_cache' in current working directory.
+    """
+    env_dir = os.environ.get("PHOTOVAULT_DATA_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    if os.path.exists("portable.flag") or os.path.exists(".photovault_portable"):
+        return os.path.abspath(".photovault_cache")
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return os.path.join(local_app_data, "PhotoVault")
+
+    return os.path.abspath(".photovault_cache")
+
 class MetadataCache:
     """
     Persistent JSON metadata cache.
@@ -10,10 +32,10 @@ class MetadataCache:
     Validates cache entries using file modification time (mtime) and file size.
     """
 
-    def __init__(self, cache_dir: str = ".photovault_cache"):
-        self.cache_dir = cache_dir
-        self.thumbnails_dir = os.path.join(cache_dir, "thumbnails")
-        self.cache_file = os.path.join(cache_dir, "metadata_cache.json")
+    def __init__(self, cache_dir: Optional[str] = None):
+        self.cache_dir = os.path.abspath(cache_dir if cache_dir else get_default_cache_dir())
+        self.thumbnails_dir = os.path.join(self.cache_dir, "thumbnails")
+        self.cache_file = os.path.join(self.cache_dir, "metadata_cache.json")
         self._entries: Dict[str, Dict[str, Any]] = {}
         self._dirty = False
         
@@ -21,8 +43,17 @@ class MetadataCache:
         self.load()
 
     def _ensure_dirs(self) -> None:
-        os.makedirs(self.cache_dir, exist_ok=True)
-        os.makedirs(self.thumbnails_dir, exist_ok=True)
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            os.makedirs(self.thumbnails_dir, exist_ok=True)
+        except Exception as e:
+            print(f"[Cache] Error creating directories at {self.cache_dir}: {e}")
+            # Fallback to user home if system folder inaccessible
+            self.cache_dir = os.path.join(os.path.expanduser("~"), ".photovault_cache")
+            self.thumbnails_dir = os.path.join(self.cache_dir, "thumbnails")
+            self.cache_file = os.path.join(self.cache_dir, "metadata_cache.json")
+            os.makedirs(self.cache_dir, exist_ok=True)
+            os.makedirs(self.thumbnails_dir, exist_ok=True)
 
     def load(self) -> None:
         if os.path.exists(self.cache_file):
